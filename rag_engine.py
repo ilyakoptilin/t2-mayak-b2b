@@ -1,116 +1,66 @@
-import time
-import httpx
+import requests
 import chromadb
-from typing import List, Dict, Any, Tuple
-from schemas import ServiceCard, SourceDoc
+from chromadb.utils import embedding_functions
 
-OLLAMA_BASE_URL = "http://localhost:11434"
-DEFAULT_MODEL = "qwen2.5:7b"
+# --- НАСТРОЙКИ ---
 CHROMA_PATH = "./chroma_db"
-COLLECTION_NAME = "mayak_b2b_regulations"
+COLLECTION_NAME = "b2b_mayak_docs"
+OLLAMA_API_URL = "http://localhost:11434/api/chat"
+DEFAULT_MODEL = "hf.co/Qwen/Qwen3-8B-GGUF:Q4_K_M"
 
-class RAGEngine:
-    def __init__(self):
-        self.chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-        self.collection = self.chroma_client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"}
-        )
+# Инициализация базы данных с НОВОЙ моделью эмбеддингов
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+    model_name="intfloat/multilingual-e5-small"
+)
+collection = chroma_client.get_or_create_collection(
+    name=COLLECTION_NAME, 
+    embedding_function=ef
+)
 
-    def search_context(self, query: str, include_archive: bool, top_k: int = 2) -> Tuple[str, List[SourceDoc]]:
-        filter_meta = None if include_archive else {"status": "new_sales"}
-        count = self.collection.count()
-        if count == 0:
-            return "", []
+def generate_rag_response(query: str, model_name: str = DEFAULT_MODEL):
+    # ВАЖНО: Модель e5 требует префикс "query: " для входящих вопросов при поиске
+    search_query = f"query: {query}"
+    
+    # Ищем 5 самых релевантных чанков
+    results = collection.query(query_texts=[search_query], n_results=5)
+    
+    context_blocks = []
+    for i in range(len(results['documents'][0])):
+        text = results['documents'][0][i]
+        source = results['metadatas'][0][i].get('source', 'Неизвестный источник')
+        context_blocks.append(f"Документ: {source}\nТекст:\n{text}")
+        
+    full_context = "\n\n".join(context_blocks)
+    
+    # Мощный системный промпт для защиты от галлюцинаций
+    system_prompt = (
+        "Ты — корпоративный B2B-ассистент 'Маяк'. Твоя задача — помогать менеджерам быстро и точно находить информацию по бизнес-процессам.\n\n"
+        "ПРАВИЛА ОТВЕТА:\n"
+        "1. СТРОГАЯ ДОСТОВЕРНОСТЬ: Отвечай только на основе предоставленного КОНТЕКСТА. Категорически запрещено выдумывать цены, тарифы, регламенты, параметры или шаги, которых нет в тексте.\n"
+        "2. ЧАСТИЧНЫЙ ОТВЕТ: Если в контексте есть хотя бы часть информации (например, только название системы, куда подать заявку, или одно условие из трех), обязательно выдай её. Не пиши «информации недостаточно», если можешь дать хоть какой-то полезный факт из контекста.\n"
+        "3. ОТСУТСТВИЕ ДАННЫХ: Если контекст вообще не относится к вопросу, прямо и коротко ответь: «В текущих регламентах базы знаний нет точной информации по этому запросу».\n"
+        "4. ФОРМАТИРОВАНИЕ: Пиши в деловом стиле, без лишней воды. Обязательно используй списки и выделяй **жирным** шрифтом названия ИТ-систем (BPM7, VAS B2B и др.), названия услуг и критические условия.\n\n"
+        f"КОНТЕКСТ:\n{full_context}"
+    )
 
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=min(top_k, count),
-            where=filter_meta
-        )
+    payload = {
+        "model": model_name, 
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            # В саму LLM отправляем чистый вопрос от пользователя, без префикса
+            {"role": "user", "content": query}
+        ],
+        "stream": False
+    }
 
-        sources: List[SourceDoc] = []
-        context_chunks: List[str] = []
-
-        if results and results["documents"] and results["documents"][0]:
-            docs = results["documents"][0]
-            metas = results["metadatas"][0]
-            ids = results["ids"][0]
-            distances = results["distances"][0] if "distances" in results and results["distances"] else [0.0] * len(docs)
-
-            for i, text in enumerate(docs):
-                meta = metas[i]
-                sim_score = round(1.0 - float(distances[i]), 3) if distances else 0.85
-                sources.append(SourceDoc(
-                    doc_id=ids[i],
-                    title=str(meta.get("title", "Регламент T2")),
-                    url=str(meta.get("url", "https://mayak.t2.ru")),
-                    status=str(meta.get("status", "new_sales")),
-                    relevance_score=max(0.0, sim_score)
-                ))
-                context_chunks.append(f"[Документ: {meta.get('title')}]: {text}")
-
-        context_text = "\n\n".join(context_chunks)
-        return context_text, sources
-
-    async def check_ollama_alive(self) -> bool:
-        try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                res = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
-                return res.status_code == 200
-        except Exception:
-            return False
-
-    async def generate_answer(self, query: str, context: str) -> Tuple[str, bool]:
-        if not context:
-            return "По вашему запросу не найдено действующих регламентов в базе «Маяк». Включите тумблер «Архив», если ищете условия для ранее подключенных договоров.", True
-
-        prompt = (
-            "Ты — интеллектуальный ассистент B2B-продаж Т2 Мобайл. "
-            "Твоя задача — дать четкий ответ менеджеру по продажам, основываясь ИСКЛЮЧИТЕЛЬНО на предоставленном контексте регламентов.\n\n"
-            f"КОНТЕКСТ РЕГЛАМЕНТА:\n{context}\n\n"
-            f"ВОПРОС ПРОДАВЦА: {query}\n\n"
-            "ТРЕБОВАНИЯ:\n"
-            "1. Ответь кратко и строго по делу.\n"
-            "2. Укажи точные цифры и цены из текста.\n"
-            "3. Если ответа нет в тексте, прямо скажи об этом."
-        )
-
-        ollama_ready = await self.check_ollama_alive()
-        if not ollama_ready:
-            mock_answer = (
-                f"[Режим демонстрации]: На основе регламентов Т2 найдены условия продукта. "
-                f"Подключение доступно для корпоративных клиентов. "
-                f"Контекст регламента: {context[:220]}..."
-            )
-            return mock_answer, True
-
-        try:
-            async with httpx.AsyncClient(timeout=40.0) as client:
-                resp = await client.post(
-                    f"{OLLAMA_BASE_URL}/api/generate",
-                    json={
-                        "model": DEFAULT_MODEL,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"temperature": 0.2}
-                    }
-                )
-                if resp.status_code == 200:
-                    return resp.json().get("response", "").strip(), False
-        except Exception:
-            pass
-
-        return f"Регламент найден: {context[:200]}...", True
-
-    def build_service_card(self, query: str, sources: List[SourceDoc]) -> ServiceCard:
-        title = sources[0].title if sources else "Корпоративный тариф Т2"
-        return ServiceCard(
-            title=title,
-            price="От 650 руб./мес. за номер",
-            target_audience="Малый и средний бизнес (юридические лица и ИП)",
-            connect_steps="1. Проверка ИНН -> 2. Выбор пакета -> 3. Подписание в ЭДО",
-            objections_handling="«Дорого» -> Показать безлимитный трафик на корпоративные сервисы и перенос остатков."
-        )
-
-rag_service = RAGEngine()
+    try:
+        response = requests.post(OLLAMA_API_URL, json=payload)
+        response.raise_for_status()
+        
+        return {
+            "answer": response.json()["message"]["content"],
+            "sources": context_blocks 
+        }
+    except Exception as e:
+        return {"answer": f"Ошибка генерации: {str(e)}", "sources": []}

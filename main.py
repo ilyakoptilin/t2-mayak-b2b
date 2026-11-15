@@ -1,55 +1,30 @@
-import time
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from schemas import SearchRequest, SearchResponse, HealthResponse
-from rag_engine import rag_service, DEFAULT_MODEL
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List
+from rag_engine import generate_rag_response
 
-app = FastAPI(
-    title="Т2 Маяк 2.0 — Интеллектуальный помощник B2B",
-    description="RAG-бэкенд для семантического поиска по регламентам Т2",
-    version="1.0.0"
-)
+app = FastAPI(title="Маяк - B2B Ассистент", version="1.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Схемы данных для валидации Pydantic
+class QueryRequest(BaseModel):
+    query: str
 
-@app.get("/api/v1/health", response_model=HealthResponse, tags=["Система"])
-async def health_check():
-    ollama_ready = await rag_service.check_ollama_alive()
-    doc_count = rag_service.collection.count()
-    return HealthResponse(
-        status="ok" if (ollama_ready and doc_count > 0) else "degraded",
-        chroma_ready=True,
-        chroma_documents_count=doc_count,
-        ollama_ready=ollama_ready,
-        model_name=DEFAULT_MODEL
-    )
+class QueryResponse(BaseModel):
+    answer: str
+    sources: List[str]
 
-@app.post("/api/v1/search", response_model=SearchResponse, tags=["Поиск B2B"])
-async def search_regulation(req: SearchRequest):
-    start_time = time.time()
-    context, sources = rag_service.search_context(
-        query=req.query,
-        include_archive=req.include_archive,
-        top_k=req.top_k
-    )
-    answer, is_mock = await rag_service.generate_answer(
-        query=req.query,
-        context=context
-    )
-    card = rag_service.build_service_card(req.query, sources) if sources else None
-    latency = int((time.time() - start_time) * 1000)
-
-    return SearchResponse(
-        query=req.query,
-        answer=answer,
-        service_card=card,
-        sources=sources,
-        is_mock=is_mock,
-        latency_ms=latency
+@app.post("/api/ask", response_model=QueryResponse)
+def ask_question(request: QueryRequest):
+    if not request.query.strip():
+        raise HTTPException(status_code=422, detail="Пустой запрос")
+    
+    # Вызываем нашу функцию (Qwen 3 подставится по умолчанию)
+    result = generate_rag_response(request.query)
+    
+    if "Ошибка генерации" in result["answer"]:
+        raise HTTPException(status_code=500, detail=result["answer"])
+        
+    return QueryResponse(
+        answer=result["answer"],
+        sources=result["sources"]
     )
